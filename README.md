@@ -14,6 +14,10 @@ python3 -m http.server 8000
 
 Open `http://localhost:8000/`. Opening `index.html` via `file://` usually prevents the health-file request from working.
 
+## Run tests
+
+With Node.js installed, run `node --test` from the repository root. The tests use Node's built-in test runner and require no packages or build step. For UI changes, also load the site in a browser.
+
 ## Publish with GitHub Pages
 
 1. Push this repository to GitHub.
