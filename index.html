@@ -3,12 +3,112 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f4ef">
     <title>Connectivity Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="app.js" defer></script>
   </head>
   <body>
-    <main>
-      <h1>Hello, world!</h1>
-      <p>Connectivity Monitor is coming soon.</p>
-    </main>
+    <div class="page-shell">
+      <header class="site-header">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true"><span></span></span>
+          <span>Connectivity<span class="brand-light"> / Monitor</span></span>
+        </div>
+        <span class="header-label">A local browser dashboard</span>
+      </header>
+
+      <main>
+        <div class="intro">
+          <p class="eyebrow">NETWORK OBSERVATIONS <span aria-hidden="true">/</span> YOUR DEVICE</p>
+          <h1>See the gaps.<br><span>Know what you measured.</span></h1>
+          <p class="intro-copy">A simple log of this browser’s connection to the site. Checks run while the page is allowed to run; time we didn’t check stays unknown.</p>
+        </div>
+
+        <div id="storage-warning" class="notice" role="alert" hidden></div>
+
+        <section class="status-panel" aria-labelledby="status-heading">
+          <div class="status-main">
+            <div class="status-symbol" id="status-symbol" data-status="paused" aria-hidden="true">
+              <span class="status-symbol-inner"></span>
+            </div>
+            <div>
+              <p class="panel-label" id="status-heading">CURRENT OBSERVATION</p>
+              <p class="status-title" id="status-title" role="status" aria-live="polite">Monitoring paused</p>
+              <p class="status-description" id="status-description">Start monitoring to make the first check.</p>
+            </div>
+          </div>
+          <span class="status-tag" id="status-tag">PAUSED</span>
+        </section>
+
+        <section class="metrics" aria-label="Check summary">
+          <div class="metric">
+            <p class="metric-label">LAST SUCCESSFUL CHECK</p>
+            <p class="metric-value" id="last-success">—</p>
+            <p class="metric-caption">Connection to this site confirmed</p>
+          </div>
+          <div class="metric">
+            <p class="metric-label">LAST CHECK</p>
+            <p class="metric-value" id="last-check">—</p>
+            <p class="metric-caption" id="last-check-caption">No checks yet</p>
+          </div>
+          <div class="metric">
+            <p class="metric-label">TODAY / ESTIMATED DOWN</p>
+            <p class="metric-value" id="today-down">0s</p>
+            <p class="metric-caption" id="today-unknown">0s unobserved</p>
+          </div>
+        </section>
+
+        <section class="control-panel" aria-labelledby="controls-heading">
+          <div class="control-copy">
+            <p class="panel-label" id="controls-heading">CONTROLS</p>
+            <p>Monitoring resumes on your next visit if you leave it enabled.</p>
+          </div>
+          <div class="control-actions">
+            <label for="interval">Check every</label>
+            <select id="interval" aria-label="Check interval">
+              <option value="15000">15 seconds</option>
+              <option value="30000">30 seconds</option>
+              <option value="60000">60 seconds</option>
+            </select>
+            <button type="button" class="button button-primary" id="start">Start monitoring</button>
+            <button type="button" class="button button-secondary" id="stop" disabled>Pause</button>
+          </div>
+        </section>
+
+        <section class="history" aria-labelledby="history-heading">
+          <div class="section-header">
+            <div>
+              <p class="eyebrow">LOCAL HISTORY</p>
+              <h2 id="history-heading">The daily record</h2>
+              <p>Estimated outages and time without checks, shown in your local time.</p>
+            </div>
+            <div class="history-actions">
+              <button type="button" class="button button-secondary" id="export">Export JSON</button>
+              <button type="button" class="button button-plain" id="clear">Clear history</button>
+            </div>
+          </div>
+          <div id="history-days" class="history-days"></div>
+          <div id="history-empty" class="empty-state">
+            <span class="empty-icon" aria-hidden="true">◎</span>
+            <p>No interruptions recorded yet.</p>
+            <span>Outages and unobserved intervals will appear here.</span>
+          </div>
+        </section>
+
+        <aside class="about-panel" aria-labelledby="about-heading">
+          <span class="about-icon" aria-hidden="true">i</span>
+          <div>
+            <h2 id="about-heading">What this measures</h2>
+            <p>Each check requests a small file from this site, not the whole internet. A failed request can also mean the site is unavailable. The first failed and next successful checks only <em>bound</em> an outage; durations use the midpoint of those bounds. When the browser is closed, asleep, or substantially delayed, that period is marked unobserved instead of counted as downtime.</p>
+          </div>
+        </aside>
+      </main>
+
+      <footer class="site-footer">
+        <span>Stored only in this browser · Export a copy for safekeeping</span>
+        <span id="browser-hint">Browser network hint: —</span>
+      </footer>
+    </div>
   </body>
 </html>
