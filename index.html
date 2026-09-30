@@ -36,9 +36,49 @@
               <p class="panel-label" id="status-heading">CURRENT OBSERVATION</p>
               <p class="status-title" id="status-title" role="status" aria-live="polite">Monitoring paused</p>
               <p class="status-description" id="status-description">Start monitoring to make the first check.</p>
+              <p class="status-freshness" id="status-freshness">No checks recorded yet</p>
             </div>
           </div>
           <span class="status-tag" id="status-tag">PAUSED</span>
+        </section>
+
+        <section class="timeline-panel" aria-labelledby="timeline-heading">
+          <div class="timeline-header">
+            <div>
+              <p class="panel-label">THE RECENT PICTURE</p>
+              <h2 id="timeline-heading">Recent observations</h2>
+            </div>
+            <div class="timeline-range" role="group" aria-label="Timeline time range">
+              <button type="button" id="timeline-hour" aria-pressed="true">Last hour</button>
+              <button type="button" id="timeline-day" aria-pressed="false">24 hours</button>
+            </div>
+          </div>
+          <div class="timeline-overview">
+            <p id="timeline-summary">0 successful · 0 failed checks</p>
+            <span>To this site, from this browser</span>
+          </div>
+          <div class="timeline-chart">
+            <span id="timeline-latest" class="timeline-latest" aria-hidden="true" hidden>Latest check</span>
+            <svg id="timeline-plot" class="timeline-plot" viewBox="0 0 1000 96" preserveAspectRatio="none" role="group" aria-label="Probe observation timeline" aria-describedby="timeline-summary timeline-caption"></svg>
+            <div id="timeline-axis" class="timeline-axis" aria-hidden="true"></div>
+          </div>
+          <ul class="timeline-legend" aria-label="Timeline legend">
+            <li><span class="legend-mark legend-success" aria-hidden="true"></span>Successful check</li>
+            <li><span class="legend-mark legend-failure" aria-hidden="true"></span>Failed check</li>
+            <li><span class="legend-mark legend-outage" aria-hidden="true"></span>Estimated outage</li>
+            <li><span class="legend-mark legend-gap" aria-hidden="true"></span>Unobserved</li>
+            <li><span class="legend-mark legend-empty" aria-hidden="true"></span>No check history</li>
+          </ul>
+          <p id="timeline-caption" class="timeline-caption">Marks are individual probes, not continuous availability. The lower band shows estimated outages. Select a mark or interval for details; use arrow keys to move between them.</p>
+          <p id="timeline-empty" class="timeline-empty">Start monitoring to build a picture of recent checks.</p>
+          <div id="timeline-detail" class="timeline-detail" data-kind="empty">
+            <p id="timeline-detail-title">No observation selected</p>
+            <p id="timeline-detail-copy">New checks appear here while monitoring is running.</p>
+          </div>
+          <div class="timeline-events" id="timeline-events" hidden>
+            <p class="panel-label">RECENT CHANGES</p>
+            <ol id="timeline-changes" class="timeline-changes"></ol>
+          </div>
         </section>
 
         <section class="metrics" aria-label="Check summary">

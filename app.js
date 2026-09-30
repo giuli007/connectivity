@@ -6,6 +6,8 @@ const LEASE_KEY = `connectivity-monitor:lease:v1:${APP_PATH}`;
 const EXPECTED_PROBE = "connectivity-monitor-ok";
 const PROBE_TIMEOUT_MS = 7000;
 const MAX_EVENTS = 1000;
+const MAX_RECENT_CHECKS = 6000;
+const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const INTERVALS = [15000, 30000, 60000];
 const tabId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
@@ -13,7 +15,10 @@ const elements = Object.fromEntries([
   "storage-warning", "status-symbol", "status-title", "status-description",
   "status-tag", "last-success", "last-check", "last-check-caption",
   "today-down", "today-unknown", "interval", "start", "stop", "export",
-  "clear", "history-days", "history-empty", "browser-hint"
+  "clear", "history-days", "history-empty", "browser-hint", "status-freshness",
+  "timeline-hour", "timeline-day", "timeline-plot", "timeline-axis",
+  "timeline-summary", "timeline-empty", "timeline-latest", "timeline-detail",
+  "timeline-detail-title", "timeline-detail-copy", "timeline-changes", "timeline-events"
 ].map(id => [id, document.getElementById(id)]));
 
 function emptyState() {
@@ -28,6 +33,7 @@ function emptyState() {
     activeOutage: null,
     outages: [],
     unknowns: [],
+    recentChecks: [],
     gapOnNextCheck: false
   };
 }
@@ -43,6 +49,17 @@ function isOutage(value) {
     (value.firstSuccessAfterAt === undefined || value.firstSuccessAfterAt === null || isTimestamp(value.firstSuccessAfterAt));
 }
 
+function isRecentCheck(value) {
+  return value && isTimestamp(value.checkedAt) && typeof value.ok === "boolean" &&
+    (value.reason === null || typeof value.reason === "string") &&
+    INTERVALS.includes(value.intervalMs) && typeof value.gapBefore === "boolean";
+}
+
+function retainRecentChecks(records, now) {
+  return records.filter(record => Date.parse(record.checkedAt) >= now - RECENT_WINDOW_MS)
+    .slice(-MAX_RECENT_CHECKS);
+}
+
 function parseState(raw) {
   try {
     const saved = JSON.parse(raw);
@@ -50,6 +67,8 @@ function parseState(raw) {
         !INTERVALS.includes(saved.intervalMs) ||
         !["unknown", "online", "offline"].includes(saved.status) ||
         !Array.isArray(saved.outages) || !Array.isArray(saved.unknowns) ||
+        (saved.recentChecks !== undefined &&
+          (!Array.isArray(saved.recentChecks) || !saved.recentChecks.every(isRecentCheck))) ||
         (saved.activeOutage !== null && !isOutage(saved.activeOutage)) ||
         !saved.outages.every(isOutage) ||
         !saved.unknowns.every(item => item && isTimestamp(item.startAt) && isTimestamp(item.endAt)) ||
@@ -60,7 +79,8 @@ function parseState(raw) {
     return {
       ...emptyState(), ...saved,
       outages: saved.outages.slice(-MAX_EVENTS),
-      unknowns: saved.unknowns.slice(-MAX_EVENTS)
+      unknowns: saved.unknowns.slice(-MAX_EVENTS),
+      recentChecks: retainRecentChecks(saved.recentChecks || [], Date.now())
     };
   } catch {
     warning = "Saved history could not be read. Monitoring starts with an empty history.";
@@ -98,6 +118,8 @@ let timer = null;
 let controller = null;
 let checking = false;
 let generation = 0;
+let timelineWindowMs = 60 * 60 * 1000;
+let timelineSelection = null;
 
 function save(nextState) {
   state = nextState;
@@ -157,6 +179,12 @@ function gapThreshold(intervalMs) {
   return Math.max(intervalMs * 2.5, intervalMs + 15000);
 }
 
+function lastObservationInterval(snapshot) {
+  const records = snapshot.recentChecks || [];
+  const latest = records[records.length - 1];
+  return latest?.checkedAt === snapshot.lastCheckedAt ? latest.intervalMs : snapshot.intervalMs;
+}
+
 function appendEvent(events, event) {
   events.push(event);
   if (events.length > MAX_EVENTS) events.shift();
@@ -165,12 +193,19 @@ function appendEvent(events, event) {
 function applyCheck(previous, ok, checkedAt, reason) {
   const next = { ...previous, outages: [...previous.outages], unknowns: [...previous.unknowns] };
   const elapsed = previous.lastCheckedAt ? Date.parse(checkedAt) - Date.parse(previous.lastCheckedAt) : 0;
-  if (previous.lastCheckedAt && (previous.gapOnNextCheck || elapsed > gapThreshold(previous.intervalMs))) {
+  const observedInterval = lastObservationInterval(previous);
+  const gapBefore = Boolean(previous.lastCheckedAt &&
+    (previous.gapOnNextCheck || elapsed > gapThreshold(observedInterval)));
+  if (gapBefore) {
     if (previous.activeOutage) appendEvent(next.outages, previous.activeOutage);
     next.activeOutage = null;
     appendEvent(next.unknowns, { startAt: previous.lastCheckedAt, endAt: checkedAt });
   }
 
+  next.recentChecks = retainRecentChecks([
+    ...(previous.recentChecks || []),
+    { checkedAt, ok, reason: ok ? null : reason, intervalMs: previous.intervalMs, gapBefore }
+  ], Date.parse(checkedAt));
   next.gapOnNextCheck = false;
   next.lastCheckedAt = checkedAt;
   if (ok) {
@@ -189,12 +224,18 @@ function applyCheck(previous, ok, checkedAt, reason) {
         firstFailureAt: checkedAt,
         lastFailureAt: checkedAt,
         lastSuccessBeforeAt: previous.status === "online" &&
-          !previous.gapOnNextCheck && elapsed <= gapThreshold(previous.intervalMs) ? previous.lastSuccessAt : null
+          !previous.gapOnNextCheck && elapsed <= gapThreshold(observedInterval) ? previous.lastSuccessAt : null
       };
     }
     next.lastFailureReason = reason;
     next.status = "offline";
   }
+  return next;
+}
+
+function markObservationGap(previous) {
+  const next = { ...previous, gapOnNextCheck: true, outages: [...previous.outages], activeOutage: null };
+  if (previous.activeOutage) appendEvent(next.outages, previous.activeOutage);
   return next;
 }
 
@@ -287,6 +328,82 @@ function dayKey(timestamp) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
+function outageBounds(record) {
+  const firstFailure = Date.parse(record.firstFailureAt);
+  const lastFailure = Date.parse(record.lastFailureAt);
+  const before = record.lastSuccessBeforeAt ? Date.parse(record.lastSuccessBeforeAt) : firstFailure;
+  const after = record.firstSuccessAfterAt ? Date.parse(record.firstSuccessAfterAt) : lastFailure;
+  return { from: (before + firstFailure) / 2, to: (lastFailure + after) / 2 };
+}
+
+function timelineData(snapshot, now, windowMs) {
+  const from = now - windowMs;
+  const checks = snapshot.recentChecks.filter(record => {
+    const time = Date.parse(record.checkedAt);
+    return time >= from && time <= now;
+  });
+  const outages = [];
+  const gaps = [];
+  function clip(target, item) {
+    if (item.to < from || item.from > now) return;
+    target.push({ ...item, sourceFrom: item.from, sourceTo: item.to,
+      from: Math.max(from, item.from), to: Math.min(now, item.to) });
+  }
+  for (const record of [...snapshot.outages, ...(snapshot.activeOutage ? [snapshot.activeOutage] : [])]) {
+    clip(outages, { kind: "outage", key: `outage:${record.firstFailureAt}`, record, ...outageBounds(record) });
+  }
+  for (const record of snapshot.unknowns) {
+    clip(gaps, { kind: "gap", key: `gap:${record.startAt}`, from: Date.parse(record.startAt), to: Date.parse(record.endAt), open: false });
+  }
+  const lastChecked = snapshot.lastCheckedAt ? Date.parse(snapshot.lastCheckedAt) : null;
+  if (lastChecked !== null && now > lastChecked &&
+      (!snapshot.enabled || snapshot.gapOnNextCheck || now - lastChecked > gapThreshold(lastObservationInterval(snapshot)))) {
+    clip(gaps, { kind: "gap", key: `gap:open:${snapshot.lastCheckedAt}`, from: lastChecked, to: now, open: true });
+  }
+
+  const changes = new Map();
+  function change(kind, time, title, detail, current = false) {
+    if (time >= from && time <= now && !changes.has(`${kind}:${time}`)) {
+      changes.set(`${kind}:${time}`, { kind, time, title, detail, current });
+    }
+  }
+  snapshot.recentChecks.forEach((record, index, records) => {
+    const previous = records[index - 1];
+    if (!previous || record.gapBefore || previous.ok !== record.ok) {
+      const title = record.gapBefore ? `Checks resumed · ${record.ok ? "site reachable" : "probe failing"}` :
+        record.ok ? (previous ? "Site reachable again" : "Site reachable") : "Probe failing";
+      change(record.ok ? "online" : "offline", Date.parse(record.checkedAt), title,
+        record.gapBefore ? "First observation after a period without checks." :
+          record.ok ? "The site's probe responded successfully." : record.reason || "The probe could not be reached.");
+    }
+  });
+  for (const item of outages) {
+    change("offline", Date.parse(item.record.firstFailureAt), "Probe failing", "First failed check of this estimated outage.");
+    if (item.record.firstSuccessAfterAt) {
+      change("online", Date.parse(item.record.firstSuccessAfterAt), "Site reachable again", "Recovery confirmed by a successful probe.");
+    }
+  }
+  for (const item of gaps) {
+    change("unknown", item.sourceTo, item.open ? (snapshot.enabled ? "Fresh check overdue" : "Monitoring paused") : "Unobserved interval",
+      `${formatDuration(item.sourceTo - item.sourceFrom)} without checks · not downtime.`, item.open);
+  }
+  return { from, to: now, checks, outages, gaps,
+    changes: [...changes.values()].sort((first, second) => second.time - first.time).slice(0, 3) };
+}
+
+function groupTimelineChecks(checks, bucketMs) {
+  const groups = new Map();
+  for (const record of checks) {
+    const bucket = Math.floor(Date.parse(record.checkedAt) / bucketMs);
+    if (!groups.has(bucket)) groups.set(bucket, { kind: "check", key: `check:${bucket}`, records: [] });
+    groups.get(bucket).records.push(record);
+  }
+  return [...groups.values()].map(group => ({ ...group,
+    from: Date.parse(group.records[0].checkedAt),
+    to: Date.parse(group.records[group.records.length - 1].checkedAt),
+    failed: group.records.filter(record => !record.ok).length }));
+}
+
 function dailyHistory() {
   const days = new Map();
   function add(kind, record, start, end) {
@@ -313,11 +430,8 @@ function dailyHistory() {
   }
 
   for (const record of [...state.outages, ...(state.activeOutage ? [state.activeOutage] : [])]) {
-    const firstFailure = Date.parse(record.firstFailureAt);
-    const lastFailure = Date.parse(record.lastFailureAt);
-    const before = record.lastSuccessBeforeAt ? Date.parse(record.lastSuccessBeforeAt) : firstFailure;
-    const after = record.firstSuccessAfterAt ? Date.parse(record.firstSuccessAfterAt) : lastFailure;
-    add("outages", record, (before + firstFailure) / 2, (lastFailure + after) / 2);
+    const { from, to } = outageBounds(record);
+    add("outages", record, from, to);
   }
   for (const record of state.unknowns) {
     add("unknowns", record, Date.parse(record.startAt), Date.parse(record.endAt));
@@ -326,7 +440,7 @@ function dailyHistory() {
 }
 
 function renderStatus() {
-  const stale = state.lastCheckedAt && Date.now() - Date.parse(state.lastCheckedAt) > gapThreshold(state.intervalMs);
+  const stale = state.lastCheckedAt && Date.now() - Date.parse(state.lastCheckedAt) > gapThreshold(lastObservationInterval(state));
   let status = "paused";
   let title = "Monitoring paused";
   let description = "Start monitoring to make the next check.";
@@ -335,7 +449,7 @@ function renderStatus() {
       status = "unknown";
       title = "Checking connection…";
       description = "Requesting this site's probe now.";
-    } else if (stale || state.status === "unknown") {
+    } else if (stale || state.gapOnNextCheck || state.status === "unknown") {
       status = "unknown";
       title = "Awaiting a fresh check";
       description = "The last result is no longer current. Unchecked time is not counted as an outage.";
@@ -353,11 +467,17 @@ function renderStatus() {
   elements["status-symbol"].dataset.status = status;
   if (elements["status-title"].textContent !== title) elements["status-title"].textContent = title;
   elements["status-description"].textContent = description;
+  const age = state.lastCheckedAt ? Math.max(0, Date.now() - Date.parse(state.lastCheckedAt)) : null;
+  elements["status-freshness"].textContent = age === null ? "No checks recorded yet" :
+    `Last checked ${age < 5000 ? "just now" : `${formatDuration(age)} ago`}${!state.enabled ? " · monitoring paused" : stale ? " · stale result" : ""}`;
   elements["status-tag"].textContent = status.toUpperCase();
   elements["last-success"].textContent = formatDateTime(state.lastSuccessAt);
   elements["last-check"].textContent = formatDateTime(state.lastCheckedAt);
+  const latestRecord = state.recentChecks[state.recentChecks.length - 1];
+  const lastResult = latestRecord?.checkedAt === state.lastCheckedAt ? latestRecord.ok :
+    state.status === "unknown" ? null : state.status === "online";
   elements["last-check-caption"].textContent = state.lastCheckedAt ?
-    (stale ? "Result is stale" : state.status === "online" ? "Probe succeeded" : "Probe failed") : "No checks yet";
+    (stale ? "Result is stale" : lastResult === null ? "Previous observation" : lastResult ? "Probe succeeded" : "Probe failed") : "No checks yet";
   elements["start"].disabled = state.enabled;
   elements["stop"].disabled = !state.enabled;
   elements.interval.value = String(state.intervalMs);
@@ -372,6 +492,183 @@ function addText(parent, tag, className, text) {
   node.textContent = text;
   parent.append(node);
   return node;
+}
+
+function addSvg(parent, tag, attributes) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+  parent.append(node);
+  return node;
+}
+
+function observationTime(timestamp) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "numeric", year: "numeric", hour: "numeric",
+    minute: "2-digit", second: "2-digit", timeZoneName: "short"
+  }).format(new Date(timestamp));
+}
+
+function describeTimelineItem(item) {
+  if (item.kind === "check") {
+    const failed = item.records.filter(record => !record.ok);
+    const latest = item.records[item.records.length - 1];
+    const single = item.records.length === 1;
+    return {
+      kind: failed.length ? "offline" : "online",
+      title: single ? (latest.ok ? "Successful probe" : "Failed probe") : `${item.records.length} checks · ${failed.length} failed`,
+      copy: single ? `${observationTime(latest.checkedAt)} · ${latest.ok ? "This site was reachable at this check." : latest.reason || "The probe could not be reached."}` :
+        `${observationTime(item.from)} – ${observationTime(item.to)} · ${item.records.length - failed.length} successful, ${failed.length} failed.${failed.length ? ` Last failure: ${failed[failed.length - 1].reason || "The probe could not be reached."}` : ""}`
+    };
+  }
+  if (item.kind === "outage") {
+    const observed = item.record === state.activeOutage && state.enabled && state.lastCheckedAt &&
+      !state.gapOnNextCheck && Date.now() - Date.parse(state.lastCheckedAt) <= gapThreshold(lastObservationInterval(state));
+    return {
+      kind: "offline",
+      title: `Estimated outage · ${item.record.firstSuccessAfterAt ? "recovered" : observed ? "being observed" : "recovery unconfirmed"}`,
+      copy: `${observationTime(item.sourceFrom)} – ${observationTime(item.sourceTo)} · ${formatDuration(item.sourceTo - item.sourceFrom)} estimated. ${item.record.lastSuccessBeforeAt ? "Bounds use check midpoints." : "Start unbounded."}`
+    };
+  }
+  return {
+    kind: "unknown",
+    title: item.open ? "Unchecked since the last probe" : "Unobserved interval",
+    copy: `${observationTime(item.sourceFrom)} – ${item.open ? "now" : observationTime(item.sourceTo)} · ${formatDuration(item.sourceTo - item.sourceFrom)} without checks. Not counted as downtime.`
+  };
+}
+
+function showTimelineDetail(item) {
+  const detail = item ? describeTimelineItem(item) : {
+    kind: "empty", title: "No observation selected", copy: "New checks appear here while monitoring is running. Older successful checks cannot be reconstructed."
+  };
+  elements["timeline-detail"].dataset.kind = detail.kind;
+  elements["timeline-detail-title"].textContent = detail.title;
+  elements["timeline-detail-copy"].textContent = detail.copy;
+}
+
+function renderTimeline() {
+  const now = Date.now();
+  const data = timelineData(state, now, timelineWindowMs);
+  const failed = data.checks.filter(record => !record.ok).length;
+  elements["timeline-summary"].textContent = `${data.checks.length - failed} successful · ${failed} failed checks`;
+  elements["timeline-hour"].setAttribute("aria-pressed", String(timelineWindowMs !== RECENT_WINDOW_MS));
+  elements["timeline-day"].setAttribute("aria-pressed", String(timelineWindowMs === RECENT_WINDOW_MS));
+  elements["timeline-empty"].hidden = data.checks.length > 0;
+  elements["timeline-empty"].textContent = state.lastCheckedAt ?
+    "No individual check history in this window. Older successes are not reconstructed; new probes appear as monitoring runs." :
+    "No check history yet. Start monitoring to build the recent picture.";
+
+  const plot = elements["timeline-plot"];
+  const width = plot.clientWidth || 1000;
+  const unit = 1000 / width;
+  const position = timestamp => Math.max(0, Math.min(1000, (timestamp - data.from) / timelineWindowMs * 1000));
+  const groups = groupTimelineChecks(data.checks, timelineWindowMs / Math.max(20, Math.min(100, Math.floor(width / 12))));
+  const items = [...groups, ...data.outages, ...data.gaps].sort((first, second) => first.from - second.from);
+  const activeKey = document.activeElement?.dataset.timelineKey;
+  const focusedKey = items.some(item => item.key === activeKey) ? activeKey : null;
+  const selected = items.find(item => item.key === timelineSelection);
+  const fragment = document.createDocumentFragment();
+  const defs = addSvg(fragment, "defs", {});
+  const pattern = addSvg(defs, "pattern", { id: "timeline-gap-pattern", width: 8, height: 8, patternUnits: "userSpaceOnUse", patternTransform: `scale(${unit} 1)` });
+  addSvg(pattern, "rect", { width: 8, height: 8, fill: "#e9eae4" });
+  addSvg(pattern, "path", { d: "M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6", stroke: "#a6afa5", "stroke-width": 1 });
+  addSvg(fragment, "rect", { x: 0, y: 26, width: 1000, height: 28, rx: 4, class: "timeline-track" });
+  addSvg(fragment, "rect", { x: 0, y: 72, width: 1000, height: 10, rx: 3, class: "timeline-track" });
+  const intervalsLayer = addSvg(fragment, "g", {});
+  const checksLayer = addSvg(fragment, "g", {});
+
+  const targets = [];
+  items.forEach((item, index) => {
+    const detail = describeTimelineItem(item);
+    const group = addSvg(item.kind === "check" ? checksLayer : intervalsLayer, "g", {
+      class: `timeline-item timeline-item-${item.kind}`, role: "button",
+      tabindex: item.key === focusedKey || (!focusedKey && index === items.length - 1) ? 0 : -1,
+      "aria-label": `${detail.title}. ${detail.copy}`
+    });
+    group.dataset.timelineKey = item.key;
+    group.dataset.selected = String(item.key === timelineSelection);
+    addSvg(group, "title", {}).textContent = `${detail.title}\n${detail.copy}`;
+    if (item.kind === "check") {
+      const latestSuccess = item.records.filter(record => record.ok).slice(-1)[0];
+      const latestFailure = item.records.filter(record => !record.ok).slice(-1)[0];
+      for (const record of [latestSuccess, latestFailure].filter(Boolean)) {
+        const center = position(Date.parse(record.checkedAt));
+        const markWidth = (record.ok ? 3 : 4) * unit;
+        addSvg(group, "rect", { x: Math.min(1000 - 12 * unit, Math.max(0, center - 6 * unit)), y: 16, width: 12 * unit, height: 45, fill: "transparent" });
+        addSvg(group, "rect", { x: Math.min(1000 - markWidth, Math.max(0, center - markWidth / 2)), y: record.ok ? 31 : 27,
+          width: markWidth, height: record.ok ? 17 : 25, rx: unit, class: `timeline-mark ${record.ok ? "probe-success" : "probe-failed"}` });
+        if (!record.ok) addSvg(group, "path", { d: `M ${Math.max(0, center - 4 * unit)} 22 L ${center} 16 L ${Math.min(1000, center + 4 * unit)} 22 Z`, class: "probe-failed" });
+      }
+    } else {
+      const left = Math.min(1000 - 2 * unit, position(item.from));
+      const markWidth = Math.min(1000 - left, Math.max(2 * unit, position(item.to) - left));
+      addSvg(group, "rect", { x: left, y: item.kind === "gap" ? 24 : 63, width: markWidth, height: item.kind === "gap" ? 34 : 27, fill: "transparent" });
+      addSvg(group, "rect", { x: left, y: item.kind === "gap" ? 26 : 72, width: markWidth, height: item.kind === "gap" ? 28 : 10,
+        rx: 2, class: "timeline-mark", fill: item.kind === "gap" ? "url(#timeline-gap-pattern)" : "#ce8976" });
+    }
+    targets.push(group);
+    function select() {
+      timelineSelection = item.key;
+      targets.forEach(target => {
+        const active = target.dataset.timelineKey === item.key;
+        target.dataset.selected = String(active);
+        target.setAttribute("tabindex", active ? "0" : "-1");
+      });
+      showTimelineDetail(item);
+    }
+    group.addEventListener("pointerenter", () => showTimelineDetail(item));
+    group.addEventListener("focus", select);
+    group.addEventListener("click", () => { select(); group.focus(); });
+    group.addEventListener("keydown", event => {
+      const directions = { ArrowLeft: Math.max(0, index - 1), ArrowRight: Math.min(items.length - 1, index + 1), Home: 0, End: items.length - 1 };
+      if (event.key in directions) {
+        event.preventDefault();
+        targets[directions[event.key]].focus();
+      } else if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        select();
+      }
+    });
+  });
+
+  addSvg(fragment, "line", { x1: 999, x2: 999, y1: 18, y2: 88, class: "timeline-now" });
+  const latestAt = state.lastCheckedAt ? Date.parse(state.lastCheckedAt) : null;
+  const latestVisible = latestAt !== null && latestAt >= data.from && latestAt <= now;
+  elements["timeline-latest"].hidden = !latestVisible;
+  if (latestVisible) {
+    const latestPosition = position(latestAt);
+    elements["timeline-latest"].style.left = `${latestPosition / 10}%`;
+    elements["timeline-latest"].dataset.edge = latestPosition < 150 ? "start" : "end";
+    addSvg(fragment, "line", { x1: latestPosition, x2: latestPosition, y1: 18, y2: 88, class: "timeline-latest-line" });
+  }
+  plot.replaceChildren(fragment);
+  const focused = targets.find(target => target.dataset.timelineKey === focusedKey);
+  if (focused) focused.focus({ preventScroll: true });
+  if (!selected && timelineSelection) timelineSelection = null;
+  const latest = data.checks[data.checks.length - 1];
+  showTimelineDetail(selected || (latest ? { kind: "check", records: [latest] } : data.gaps[data.gaps.length - 1] || data.outages[data.outages.length - 1]));
+
+  const axis = document.createDocumentFragment();
+  for (let index = 0; index <= 4; index += 1) {
+    const time = data.from + timelineWindowMs * index / 4;
+    const label = index === 4 ? "Now" : new Intl.DateTimeFormat(undefined, {
+      hour: "numeric", minute: "2-digit", ...(timelineWindowMs === RECENT_WINDOW_MS ? { month: "short", day: "numeric" } : {})
+    }).format(time);
+    addText(axis, "span", "", label);
+  }
+  elements["timeline-axis"].replaceChildren(axis);
+  const changes = document.createDocumentFragment();
+  for (const change of data.changes) {
+    const entry = document.createElement("li");
+    entry.className = `timeline-change change-${change.kind}`;
+    const copy = document.createElement("div");
+    addText(copy, "p", "change-title", change.title);
+    addText(copy, "p", "change-time", change.current ? "Now · no fresh observation" : observationTime(change.time));
+    addText(copy, "p", "change-description", change.detail);
+    entry.append(copy);
+    changes.append(entry);
+  }
+  elements["timeline-events"].hidden = data.changes.length === 0;
+  elements["timeline-changes"].replaceChildren(changes);
 }
 
 function renderHistory() {
@@ -431,7 +728,16 @@ function renderHistory() {
 
 function render() {
   renderStatus();
+  renderTimeline();
   renderHistory();
+}
+
+for (const [id, windowMs] of [["timeline-hour", 60 * 60 * 1000], ["timeline-day", RECENT_WINDOW_MS]]) {
+  elements[id].addEventListener("click", () => {
+    timelineWindowMs = windowMs;
+    timelineSelection = null;
+    renderTimeline();
+  });
 }
 
 elements.start.addEventListener("click", () => {
@@ -443,13 +749,7 @@ elements.start.addEventListener("click", () => {
 elements.stop.addEventListener("click", () => {
   if (!state.enabled) return;
   cancel();
-  const next = { ...readState(), enabled: false, gapOnNextCheck: true };
-  if (next.activeOutage) {
-    next.outages = [...next.outages];
-    appendEvent(next.outages, next.activeOutage);
-    next.activeOutage = null;
-  }
-  save(next);
+  save({ ...markObservationGap(readState()), enabled: false });
   releaseLease();
 });
 
@@ -494,6 +794,7 @@ window.addEventListener("storage", event => {
 
 window.addEventListener("pagehide", () => {
   cancel();
+  if (state.enabled && ownsLease()) save(markObservationGap(readState()));
   releaseLease();
 });
 
@@ -506,6 +807,7 @@ window.addEventListener("pageshow", event => {
 
 document.addEventListener("visibilitychange", () => {
   renderStatus();
+  renderTimeline();
   if (document.visibilityState === "visible" && state.enabled && !checking &&
       (!state.lastCheckedAt || Date.now() - Date.parse(state.lastCheckedAt) >= state.intervalMs)) {
     schedule(0);
@@ -514,6 +816,10 @@ document.addEventListener("visibilitychange", () => {
 
 window.addEventListener("online", renderStatus);
 window.addEventListener("offline", renderStatus);
-setInterval(renderStatus, 5000);
+window.addEventListener("resize", renderTimeline);
+setInterval(() => {
+  renderStatus();
+  renderTimeline();
+}, 5000);
 render();
 if (state.enabled) schedule(0);

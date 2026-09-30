@@ -12,8 +12,13 @@ function createNode(tagName = "div") {
     tagName,
     children: [],
     dataset: {},
+    style: {},
+    attributes: new Map(),
     listeners: new Map(),
     textContent: "",
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    click() { this.listeners.get("click")?.(); },
     addEventListener(event, listener) { this.listeners.set(event, listener); },
     append(...nodes) {
       for (const node of nodes) {
@@ -48,19 +53,31 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
   const nodes = new Map();
   const timers = new Map();
   const windowListeners = new Map();
+  const documentListeners = new Map();
+  const intervals = [];
+  const downloads = [];
   const responses = [];
   const requests = [];
   let nextTimerId = 0;
   let unqueuedRequests = 0;
+  function createElement(tagName) {
+    const node = createNode(tagName);
+    node.focus = () => {
+      document.activeElement = node;
+      node.listeners.get("focus")?.();
+    };
+    return node;
+  }
   const document = {
     baseURI: "https://example.github.io/connectivity/",
     getElementById(id) {
-      if (!nodes.has(id)) nodes.set(id, createNode());
+      if (!nodes.has(id)) nodes.set(id, createElement());
       return nodes.get(id);
     },
-    createElement: createNode,
-    createDocumentFragment() { return createNode("#fragment"); },
-    addEventListener() {}
+    createElement,
+    createElementNS(namespace, tagName) { return createElement(tagName); },
+    createDocumentFragment() { return createElement("#fragment"); },
+    addEventListener(event, listener) { documentListeners.set(event, listener); }
   };
   const window = {
     get localStorage() {
@@ -74,8 +91,12 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
     addEventListener(event, listener) { windowListeners.set(event, listener); },
     confirm() { return true; }
   };
+  class TestURL extends URL {
+    static createObjectURL(blob) { downloads.push(blob); return "blob:test"; }
+    static revokeObjectURL() {}
+  }
   const context = vm.createContext({
-    document, window, navigator: { onLine: true }, URL, Intl, Date: TestDate,
+    document, window, navigator: { onLine: true }, URL: TestURL, Intl, Date: TestDate,
     Math, AbortController, Blob,
     setTimeout(callback, delay) {
       const id = ++nextTimerId;
@@ -83,7 +104,7 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
       return id;
     },
     clearTimeout(id) { timers.delete(id); },
-    setInterval() {},
+    setInterval(callback) { intervals.push(callback); },
     fetch(url, options) {
       requests.push({ url, options });
       const response = responses.shift();
@@ -100,12 +121,14 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
   vm.runInContext(source, context, { filename: "app.js" });
 
   return {
-    clock, nodes, requests, responses,
+    clock, nodes, requests, responses, downloads, document,
     state() { return shared.has(dataKey) ? JSON.parse(shared.get(dataKey)) : vm.runInContext("state", context); },
     memoryState() { return vm.runInContext("state", context); },
     evaluate(expression) { return vm.runInContext(expression, context); },
     click(id) { nodes.get(id).listeners.get("click")(); },
-    dispatch(event) { windowListeners.get(event)(); },
+    dispatch(event, value) { windowListeners.get(event)(value); },
+    dispatchDocument(event) { documentListeners.get(event)(); },
+    pulse() { intervals.forEach(callback => callback()); },
     async fire(delay) {
       const entry = [...timers].find(([, timer]) => timer.delay === delay);
       assert.ok(entry, `Expected a ${delay}ms timer`);
@@ -143,6 +166,9 @@ test("manual start checks the relative uncached probe and records a recovery", a
   assert.equal(browser.state().activeOutage, null);
   assert.equal(browser.state().outages[0].firstSuccessAfterAt, "2026-09-27T12:00:30.000Z");
   assert.equal(browser.evaluate("dailyHistory().get(dayKey(Date.now())).downtime"), 15000);
+  assert.deepEqual(browser.state().recentChecks.map(record => record.ok), [true, false, true]);
+  assert.ok(browser.state().recentChecks.every(record => record.intervalMs === 15000 && record.gapBefore === false));
+  assert.equal(browser.state().recentChecks[1].reason, "The probe could not be reached.");
 });
 
 test("a long unchecked gap splits an outage instead of counting it as downtime", async () => {
@@ -221,12 +247,14 @@ test("a storage lease allows only one tab to check, then permits takeover", asyn
   const follower = createBrowser({ shared, clock });
   await follower.fire(0);
   assert.equal(follower.requests.length, 0);
+  assert.equal(follower.state().recentChecks.length, 1);
   leader.dispatch("pagehide");
   clock.now += 5000;
   follower.responses.push("connectivity-monitor-ok");
   await follower.fire(5000);
   assert.equal(follower.requests.length, 1);
   assert.equal(follower.state().outages.length, 0);
+  assert.equal(follower.state().recentChecks.length, 2);
 });
 
 test("an unexpected response and a timed-out probe are failures", async () => {
@@ -253,6 +281,8 @@ test("checking continues in memory when localStorage is unavailable", async () =
   await browser.fire(0);
   assert.equal(browser.memoryState().status, "online");
   assert.ok(browser.memoryState().lastSuccessAt);
+  assert.equal(browser.memoryState().recentChecks.length, 1);
+  assert.equal(browser.nodes.get("timeline-summary").textContent, "1 successful · 0 failed checks");
 });
 
 test("clearing history preserves the enabled setting and interval", async () => {
@@ -275,10 +305,12 @@ test("clearing history preserves the enabled setting and interval", async () => 
   assert.equal(cleared.activeOutage, null);
   assert.equal(cleared.outages.length, 0);
   assert.equal(cleared.unknowns.length, 0);
+  assert.equal(cleared.recentChecks.length, 0);
 
   browser.responses.push("connectivity-monitor-ok");
   await browser.fire(0);
   assert.equal(browser.state().status, "online");
+  assert.equal(browser.state().recentChecks.length, 1);
 });
 
 test("daily totals split at local midnight even across a daylight-saving day", () => {
@@ -301,6 +333,278 @@ test("daily totals split at local midnight even across a daylight-saving day", (
     assert.equal(days.get("2026-03-29").unobserved, 30000);
     assert.equal(days.get("2026-03-29").downtime, 30000);
     assert.equal(days.get("2026-03-30").downtime, 30000);
+  } finally {
+    if (previousTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTimezone;
+  }
+});
+
+test("existing version-1 history loads without fabricating individual checks", async () => {
+  const initial = createBrowser();
+  const saved = JSON.parse(initial.evaluate("JSON.stringify(emptyState())"));
+  delete saved.recentChecks;
+  saved.intervalMs = 30000;
+  saved.status = "online";
+  saved.lastCheckedAt = "2026-09-27T11:59:00.000Z";
+  saved.lastSuccessAt = saved.lastCheckedAt;
+  saved.outages.push({
+    firstFailureAt: "2026-09-27T11:00:00.000Z", lastFailureAt: "2026-09-27T11:00:30.000Z",
+    lastSuccessBeforeAt: null, firstSuccessAfterAt: "2026-09-27T11:01:00.000Z"
+  });
+  const browser = createBrowser({ shared: new Map([[dataKey, JSON.stringify(saved)]]) });
+  assert.equal(browser.memoryState().recentChecks.length, 0);
+  assert.equal(browser.memoryState().outages.length, 1);
+  assert.equal(browser.memoryState().intervalMs, 30000);
+  assert.equal(browser.nodes.get("timeline-summary").textContent, "0 successful · 0 failed checks");
+  assert.match(browser.nodes.get("timeline-empty").textContent, /not reconstructed/);
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  assert.equal(browser.state().recentChecks.length, 1);
+  assert.equal(browser.state().outages.length, 1);
+});
+
+test("recent-check validation rejects malformed data and prunes expired saved checks", () => {
+  const browser = createBrowser();
+  const saved = JSON.parse(browser.evaluate("JSON.stringify(emptyState())"));
+  saved.recentChecks = [
+    { checkedAt: "2026-09-26T11:59:59.000Z", ok: true, reason: null, intervalMs: 15000, gapBefore: false },
+    { checkedAt: "2026-09-26T12:00:00.000Z", ok: true, reason: null, intervalMs: 15000, gapBefore: false },
+    { checkedAt: "2026-09-27T12:00:00.000Z", ok: false, reason: "Network error", intervalMs: 30000, gapBefore: true }
+  ];
+  const loaded = createBrowser({ shared: new Map([[dataKey, JSON.stringify(saved)]]) });
+  assert.equal(loaded.memoryState().recentChecks.length, 2);
+  assert.equal(loaded.memoryState().recentChecks[0].checkedAt, "2026-09-26T12:00:00.000Z");
+  assert.equal(loaded.nodes.get("timeline-summary").textContent, "0 successful · 1 failed checks");
+  saved.recentChecks[2].gapBefore = "yes";
+  const invalid = createBrowser({ shared: new Map([[dataKey, JSON.stringify(saved)]]) });
+  assert.equal(invalid.memoryState().recentChecks.length, 0);
+  assert.match(invalid.nodes.get("storage-warning").textContent, /could not be read/);
+});
+
+test("recent history is time-bounded, capped, and does not mutate the input", () => {
+  const browser = createBrowser();
+  const result = browser.evaluate(`(() => {
+    const records = Array.from({ length: 6001 }, (_value, index) => ({ checkedAt: new Date(Date.now() - 6000 + index).toISOString() }));
+    const retained = retainRecentChecks(records, Date.now());
+    return { count: retained.length, original: records.length, first: retained[0].checkedAt };
+  })()`);
+  assert.equal(result.count, 6000);
+  assert.equal(result.original, 6001);
+  assert.equal(result.first, new Date(browser.clock.now - 5999).toISOString());
+  assert.equal(browser.evaluate(`retainRecentChecks([
+    { checkedAt: new Date(Date.now() - RECENT_WINDOW_MS - 1).toISOString() },
+    { checkedAt: new Date(Date.now() - RECENT_WINDOW_MS).toISOString() }
+  ], Date.now()).length`), 1);
+});
+
+test("the timeline clips observations and estimated bounds to its window without changing history", () => {
+  const browser = createBrowser();
+  const snapshot = browser.memoryState();
+  snapshot.recentChecks = ["2026-09-27T10:59:59.000Z", "2026-09-27T11:00:00.000Z", "2026-09-27T12:00:00.000Z", "2026-09-27T12:00:01.000Z"]
+    .map(checkedAt => ({ checkedAt, ok: true, reason: null, intervalMs: 15000, gapBefore: false }));
+  snapshot.outages.push({
+    firstFailureAt: "2026-09-27T10:59:00.000Z", lastFailureAt: "2026-09-27T11:15:00.000Z",
+    lastSuccessBeforeAt: "2026-09-27T10:58:00.000Z", firstSuccessAfterAt: "2026-09-27T11:16:00.000Z"
+  });
+  snapshot.outages.push({ firstFailureAt: "2026-09-27T12:00:00.000Z", lastFailureAt: "2026-09-27T12:00:00.000Z", lastSuccessBeforeAt: null });
+  snapshot.unknowns.push({ startAt: "2026-09-27T11:55:00.000Z", endAt: "2026-09-27T12:05:00.000Z" });
+  const original = JSON.stringify(snapshot);
+  const data = browser.evaluate("timelineData(state, Date.now(), 60 * 60 * 1000)");
+  assert.equal(data.checks.length, 2);
+  assert.equal(data.outages[0].from, Date.parse("2026-09-27T11:00:00Z"));
+  assert.equal(data.outages[0].sourceFrom, Date.parse("2026-09-27T10:58:30Z"));
+  assert.equal(data.outages[0].to, Date.parse("2026-09-27T11:15:30Z"));
+  assert.equal(data.outages[1].from, data.outages[1].to);
+  assert.equal(data.gaps[0].to, browser.clock.now);
+  assert.equal(data.gaps[0].sourceTo, Date.parse("2026-09-27T12:05:00Z"));
+  assert.equal(JSON.stringify(snapshot), original);
+});
+
+test("stale tails become unobserved without saving probes or extending downtime", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.clock.now += 15000;
+  browser.responses.push("network-error");
+  await browser.fire(15000);
+  const recorded = JSON.stringify(browser.state());
+  browser.clock.now += 40000;
+  browser.pulse();
+  assert.equal(browser.nodes.get("status-title").textContent, "Awaiting a fresh check");
+  assert.match(browser.nodes.get("status-freshness").textContent, /40s ago · stale result/);
+  const data = browser.evaluate("timelineData(state, Date.now(), timelineWindowMs)");
+  assert.equal(data.gaps.length, 1);
+  assert.equal(data.gaps[0].open, true);
+  assert.equal(data.gaps[0].sourceFrom, Date.parse("2026-09-27T12:00:15Z"));
+  assert.equal(data.outages[0].sourceTo, Date.parse("2026-09-27T12:00:15Z"));
+  assert.equal(browser.evaluate("dailyHistory().get(dayKey(Date.now())).downtime"), 7500);
+  assert.equal(JSON.stringify(browser.state()), recorded);
+  assert.match(browser.nodes.get("timeline-changes").children[0].children[0].children[0].textContent, /overdue/);
+});
+
+test("a short pause is visible immediately and a later success is not a recovery across the gap", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("network-error");
+  await browser.fire(0);
+  browser.clock.now += 1000;
+  browser.click("stop");
+  assert.match(browser.nodes.get("status-freshness").textContent, /monitoring paused/);
+  assert.equal(browser.evaluate("timelineData(state, Date.now(), timelineWindowMs).gaps[0].open"), true);
+  browser.clock.now += 1000;
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  assert.equal(browser.state().recentChecks[1].gapBefore, true);
+  const data = browser.evaluate("timelineData(state, Date.now(), timelineWindowMs)");
+  assert.equal(data.gaps[0].open, false);
+  assert.ok(data.changes.some(change => change.title === "Checks resumed · site reachable"));
+  assert.ok(data.changes.every(change => change.title !== "Site reachable again"));
+  assert.equal(browser.evaluate("dailyHistory().get(dayKey(Date.now())).downtime"), 0);
+});
+
+test("even a short page close splits an outage while closing a follower leaves monitoring alone", async () => {
+  const shared = new Map();
+  const clock = { now: Date.parse("2026-09-27T12:00:00Z") };
+  const leader = createBrowser({ shared, clock });
+  leader.click("start");
+  leader.responses.push("network-error");
+  await leader.fire(0);
+  const follower = createBrowser({ shared, clock });
+  const before = shared.get(dataKey);
+  follower.dispatch("pagehide");
+  assert.equal(shared.get(dataKey), before);
+  leader.dispatch("pagehide");
+  assert.equal(leader.state().gapOnNextCheck, true);
+  assert.equal(leader.state().activeOutage, null);
+  clock.now += 1000;
+  const reopened = createBrowser({ shared, clock });
+  reopened.responses.push("connectivity-monitor-ok");
+  await reopened.fire(0);
+  assert.equal(reopened.state().recentChecks[1].gapBefore, true);
+  assert.equal(reopened.state().unknowns.length, 1);
+  assert.equal(reopened.state().outages[0].firstSuccessAfterAt, undefined);
+});
+
+test("changing the check interval preserves context and cannot hide an already overdue gap", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.clock.now += 60000;
+  browser.nodes.get("interval").value = "60000";
+  browser.nodes.get("interval").listeners.get("change")();
+  assert.equal(browser.nodes.get("status-title").textContent, "Awaiting a fresh check");
+  browser.responses.push("network-error");
+  await browser.fire(0);
+  assert.equal(browser.state().recentChecks[0].intervalMs, 15000);
+  assert.equal(browser.state().recentChecks[1].intervalMs, 60000);
+  assert.equal(browser.state().recentChecks[1].gapBefore, true);
+  assert.equal(browser.state().activeOutage.lastSuccessBeforeAt, null);
+  browser.clock.now += 60000;
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(60000);
+  assert.equal(browser.state().recentChecks[2].gapBefore, false);
+  assert.equal(browser.state().unknowns.length, 1);
+});
+
+test("dense groups keep failures and provide the actual recorded timestamps", () => {
+  const browser = createBrowser();
+  const groups = browser.evaluate(`groupTimelineChecks([
+    { checkedAt: "2026-09-27T12:00:00Z", ok: true, reason: null },
+    { checkedAt: "2026-09-27T12:00:15Z", ok: false, reason: "Timed out" },
+    { checkedAt: "2026-09-27T12:00:30Z", ok: true, reason: null }
+  ], 60000)`);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].failed, 1);
+  assert.equal(groups[0].records.length, 3);
+  assert.equal(groups[0].from, Date.parse("2026-09-27T12:00:00Z"));
+  assert.equal(groups[0].to, Date.parse("2026-09-27T12:00:30Z"));
+  browser.memoryState().recentChecks = groups[0].records;
+  const description = browser.evaluate("describeTimelineItem(groupTimelineChecks(state.recentChecks, 60000)[0])");
+  assert.equal(description.title, "3 checks · 1 failed");
+  assert.match(description.copy, /2 successful, 1 failed.*Timed out/);
+});
+
+test("timeline range controls and roving keyboard focus work across live refreshes", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.clock.now += 15000;
+  browser.responses.push("network-error");
+  await browser.fire(15000);
+  function targets(node = browser.nodes.get("timeline-plot")) {
+    return [...(node.getAttribute("role") === "button" ? [node] : []), ...node.children.flatMap(child => targets(child))];
+  }
+  const initial = targets();
+  assert.ok(initial.length >= 2);
+  assert.equal(initial.filter(node => node.getAttribute("tabindex") === "0").length, 1);
+  initial[0].focus();
+  let prevented = false;
+  initial[0].listeners.get("keydown")({ key: "End", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(browser.document.activeElement.dataset.timelineKey, "outage:2026-09-27T12:00:15.000Z");
+  const key = browser.document.activeElement.dataset.timelineKey;
+  browser.clock.now += 5000;
+  browser.pulse();
+  assert.equal(browser.document.activeElement.dataset.timelineKey, key);
+  assert.notEqual(browser.document.activeElement, initial[initial.length - 1]);
+  browser.click("timeline-day");
+  assert.equal(browser.nodes.get("timeline-day").getAttribute("aria-pressed"), "true");
+  assert.equal(browser.evaluate("timelineWindowMs"), 24 * 60 * 60 * 1000);
+  assert.equal(targets().filter(node => node.getAttribute("tabindex") === "0").length, 1);
+  browser.click("timeline-hour");
+  assert.equal(browser.nodes.get("timeline-hour").getAttribute("aria-pressed"), "true");
+});
+
+test("JSON exports include recent observations", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.click("export");
+  const exported = JSON.parse(await browser.downloads[0].text());
+  assert.deepEqual(exported.recentChecks, browser.state().recentChecks);
+  assert.equal(exported.exportedAt, new Date(browser.clock.now).toISOString());
+});
+
+test("resuming and checking do not relabel a successful previous observation as failed", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.click("stop");
+  browser.clock.now += 1000;
+  browser.click("start");
+  assert.equal(browser.nodes.get("last-check-caption").textContent, "Probe succeeded");
+  browser.responses.push("timeout");
+  await browser.fire(0);
+  assert.equal(browser.nodes.get("status-title").textContent, "Checking connection…");
+  assert.equal(browser.nodes.get("last-check-caption").textContent, "Probe succeeded");
+  assert.equal(browser.state().recentChecks.length, 1);
+  browser.clock.now += 7000;
+  await browser.fire(7000);
+  assert.equal(browser.nodes.get("last-check-caption").textContent, "Probe failed");
+  assert.equal(browser.state().recentChecks[1].gapBefore, true);
+});
+
+test("24-hour windows remain UTC-based through DST and local timestamps distinguish repeated times", () => {
+  const previousTimezone = process.env.TZ;
+  process.env.TZ = "Europe/London";
+  try {
+    const browser = createBrowser({ clock: { now: Date.parse("2026-10-25T02:15:00Z") } });
+    const snapshot = browser.memoryState();
+    snapshot.recentChecks = ["2026-10-25T00:30:00.000Z", "2026-10-25T01:30:00.000Z"]
+      .map(checkedAt => ({ checkedAt, ok: true, reason: null, intervalMs: 60000, gapBefore: true }));
+    const data = browser.evaluate("timelineData(state, Date.now(), RECENT_WINDOW_MS)");
+    assert.equal(data.to - data.from, 24 * 60 * 60 * 1000);
+    assert.equal(data.checks.length, 2);
+    assert.equal(browser.evaluate("dayKey(state.recentChecks[0].checkedAt)"), "2026-10-25");
+    assert.notEqual(browser.evaluate("observationTime(state.recentChecks[0].checkedAt)"), browser.evaluate("observationTime(state.recentChecks[1].checkedAt)"));
+    assert.equal(snapshot.recentChecks[0].checkedAt, "2026-10-25T00:30:00.000Z");
   } finally {
     if (previousTimezone === undefined) delete process.env.TZ;
     else process.env.TZ = previousTimezone;
