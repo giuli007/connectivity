@@ -2,7 +2,7 @@
 
 A browser-only connectivity log for a static site. While the page is running, it requests its own `health.txt` at a selected interval (15 seconds by default), bypasses caches, checks the file's contents, and gives up after 7 seconds. No backend, build step, account, or external endpoint is required.
 
-Start monitoring once to enable it; subsequent visits resume automatically until you select **Pause**. The dashboard shows the most recent observation, last successful check, estimated daily downtime, and unobserved time. **Export JSON** downloads the stored data; **Clear history** removes observations after confirmation but keeps your enabled setting and check interval.
+Start monitoring once to enable it; subsequent visits resume automatically until you select **Pause**. The dashboard shows the most recent observation, last successful check, estimated daily downtime, and unobserved time. **Export JSON** downloads the stored data; **Import JSON** restores such a file, replacing the history in this browser after confirmation; **Clear history** removes observations after confirmation. Import and clear both keep your enabled setting and check interval.
 
 ## Recent observations
 
@@ -10,7 +10,7 @@ The timeline below the current status shows recorded probes over the **Last hour
 
 Hover, select, or tap a mark or interval to see its timestamps and result. Tab into the plot and use the arrow keys, Home, or End to move between items. Dense views group nearby checks, preserving any failure and showing successful/failed counts in the details. The recent-changes list provides a textual summary, and timestamps in details include the local time zone.
 
-Recent checks are stored in UTC for the latest 24 hours, capped at 6,000 records and pruned when history is read or a check completes. They are included in JSON exports and removed by **Clear history**. Existing saved outage history remains compatible, but older individual successes cannot be reconstructed; the timeline fills as new probes run. Paused and stale unchecked tails are shown as unobserved without adding to estimated downtime. The status panel also shows how old the latest observation is.
+Recent checks are stored in UTC for the latest 24 hours, capped at 6,000 records and pruned when history is read or a check completes. They are included in JSON exports, restored by imports, and removed by **Clear history**. Existing saved outage history remains compatible, but older individual successes cannot be reconstructed; the timeline fills as new probes run. Paused and stale unchecked tails are shown as unobserved without adding to estimated downtime. The status panel also shows how old the latest observation is.
 
 ## View locally
 
@@ -41,6 +41,7 @@ GitHub Pages will serve the root `index.html` as the homepage. The health-file r
 - If there was no earlier success, the start is unbounded and the estimate begins at the first failure. If monitoring stops or a long gap occurs while the probe is failing, the outage ends at its last observed failure, with recovery unconfirmed. Time after that is **not** counted as downtime.
 - A gap longer than `max(2.5 × the check interval, the check interval + 15 seconds)` is recorded as unobserved from the previous check to the next one. Pausing also marks the interval until the next check as unobserved. Outages spanning a gap are split, never assumed to continue across it.
 - Leaving the page in the checking tab also marks the next observation as following a gap, even for a short absence. Closing a follower tab does not interrupt the checking tab. Changing the interval cannot retroactively make an already overdue observation fresh.
+- Importing a file validates it before asking for confirmation; invalid files change nothing. Older exports without recent checks are accepted. An outage still ongoing in the file is kept as recovery unconfirmed, and the time between the file's last check and the next check here is recorded as unobserved, never as uptime or downtime. Imported recent checks older than 24 hours are dropped; the same retention limits apply as for stored history.
 - Timestamps are stored in UTC and displayed in your local time zone. Daily totals split at local midnight, including on daylight-saving transitions. The latest 1,000 outages and 1,000 unobserved intervals are retained; export regularly if you need a longer archive.
 
 ## Limits

@@ -7,6 +7,7 @@ const EXPECTED_PROBE = "connectivity-monitor-ok";
 const PROBE_TIMEOUT_MS = 7000;
 const MAX_EVENTS = 1000;
 const MAX_RECENT_CHECKS = 6000;
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const INTERVALS = [15000, 30000, 60000];
 const tabId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -15,7 +16,8 @@ const elements = Object.fromEntries([
   "storage-warning", "status-symbol", "status-title", "status-description",
   "status-tag", "last-success", "last-check", "last-check-caption",
   "today-down", "today-unknown", "interval", "start", "stop", "export",
-  "clear", "history-days", "history-empty", "browser-hint", "status-freshness",
+  "import", "import-file", "import-status", "clear", "history-days",
+  "history-empty", "browser-hint", "status-freshness",
   "timeline-hour", "timeline-day", "timeline-plot", "timeline-axis",
   "timeline-summary", "timeline-empty", "timeline-latest", "timeline-detail",
   "timeline-detail-title", "timeline-detail-copy", "timeline-changes", "timeline-events"
@@ -60,28 +62,33 @@ function retainRecentChecks(records, now) {
     .slice(-MAX_RECENT_CHECKS);
 }
 
+function normalizeState(raw) {
+  const saved = JSON.parse(raw);
+  if (!saved || typeof saved !== "object" || saved.version !== 1 || typeof saved.enabled !== "boolean" ||
+      !INTERVALS.includes(saved.intervalMs) ||
+      !["unknown", "online", "offline"].includes(saved.status) ||
+      !Array.isArray(saved.outages) || !Array.isArray(saved.unknowns) ||
+      (saved.recentChecks !== undefined &&
+        (!Array.isArray(saved.recentChecks) || !saved.recentChecks.every(isRecentCheck))) ||
+      (saved.activeOutage !== null && !isOutage(saved.activeOutage)) ||
+      !saved.outages.every(isOutage) ||
+      !saved.unknowns.every(item => item && isTimestamp(item.startAt) && isTimestamp(item.endAt)) ||
+      (saved.lastCheckedAt !== null && !isTimestamp(saved.lastCheckedAt)) ||
+      (saved.lastSuccessAt !== null && !isTimestamp(saved.lastSuccessAt))) {
+    throw new Error("Invalid saved history");
+  }
+  const { exportedAt, ...fields } = saved;
+  return {
+    ...emptyState(), ...fields,
+    outages: saved.outages.slice(-MAX_EVENTS),
+    unknowns: saved.unknowns.slice(-MAX_EVENTS),
+    recentChecks: retainRecentChecks(saved.recentChecks || [], Date.now())
+  };
+}
+
 function parseState(raw) {
   try {
-    const saved = JSON.parse(raw);
-    if (saved.version !== 1 || typeof saved.enabled !== "boolean" ||
-        !INTERVALS.includes(saved.intervalMs) ||
-        !["unknown", "online", "offline"].includes(saved.status) ||
-        !Array.isArray(saved.outages) || !Array.isArray(saved.unknowns) ||
-        (saved.recentChecks !== undefined &&
-          (!Array.isArray(saved.recentChecks) || !saved.recentChecks.every(isRecentCheck))) ||
-        (saved.activeOutage !== null && !isOutage(saved.activeOutage)) ||
-        !saved.outages.every(isOutage) ||
-        !saved.unknowns.every(item => item && isTimestamp(item.startAt) && isTimestamp(item.endAt)) ||
-        (saved.lastCheckedAt !== null && !isTimestamp(saved.lastCheckedAt)) ||
-        (saved.lastSuccessAt !== null && !isTimestamp(saved.lastSuccessAt))) {
-      throw new Error("Invalid saved history");
-    }
-    return {
-      ...emptyState(), ...saved,
-      outages: saved.outages.slice(-MAX_EVENTS),
-      unknowns: saved.unknowns.slice(-MAX_EVENTS),
-      recentChecks: retainRecentChecks(saved.recentChecks || [], Date.now())
-    };
+    return normalizeState(raw);
   } catch {
     warning = "Saved history could not be read. Monitoring starts with an empty history.";
     return emptyState();
@@ -237,6 +244,13 @@ function markObservationGap(previous) {
   const next = { ...previous, gapOnNextCheck: true, outages: [...previous.outages], activeOutage: null };
   if (previous.activeOutage) appendEvent(next.outages, previous.activeOutage);
   return next;
+}
+
+function importedState(imported, current) {
+  // Nothing was observed between the file's last check and the next one here.
+  const next = markObservationGap(imported);
+  return { ...next, enabled: current.enabled, intervalMs: current.intervalMs,
+    gapOnNextCheck: next.lastCheckedAt !== null };
 }
 
 async function probe(signal) {
@@ -769,6 +783,34 @@ elements.export.addEventListener("click", () => {
   link.download = `connectivity-history-${dayKey(Date.now())}.json`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+elements.import.addEventListener("click", () => elements["import-file"].click());
+
+elements["import-file"].addEventListener("change", async () => {
+  const input = elements["import-file"];
+  const file = input.files?.[0];
+  if (!file) return;
+  input.value = "";
+  const status = elements["import-status"];
+  if (file.size > MAX_IMPORT_BYTES) {
+    status.textContent = `${file.name} is larger than 10 MB and was not imported. Nothing was changed.`;
+    return;
+  }
+  let imported;
+  try {
+    imported = normalizeState(await file.text());
+  } catch {
+    status.textContent = `${file.name} is not a connectivity history export. Nothing was changed.`;
+    return;
+  }
+  if (!window.confirm(`Replace all recorded outages, unobserved intervals, and check history in this browser with ${file.name}? Export first if you want to keep the current history.`)) return;
+  cancel();
+  save(importedState(imported, readState()));
+  const plural = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+  status.textContent = `Imported ${file.name}: ${plural(state.outages.length, "outage")}, ` +
+    `${plural(state.unknowns.length, "unobserved interval")}, ${plural(state.recentChecks.length, "recent check")}.`;
+  if (state.enabled) schedule(0);
 });
 
 elements.clear.addEventListener("click", () => {

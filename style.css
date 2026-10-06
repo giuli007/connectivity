@@ -150,6 +150,8 @@ select { background: #fff; color: #173a39; }
 .section-header h2 { margin-bottom: 7px; font-size: 31px; letter-spacing: -.05em; }
 .section-header p:last-child { margin-bottom: 0; color: #667875; font-size: 14px; line-height: 1.5; }
 .history-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.import-status { margin: -12px 0 18px; color: #5b6f6a; font-size: 13px; line-height: 1.4; }
+.import-status:empty { display: none; }
 .history-days { display: grid; gap: 12px; }
 .day { overflow: hidden; border: 1px solid #e0e5df; border-radius: 10px; background: #fff; }
 .day summary { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 20px 24px; cursor: pointer; list-style: none; }

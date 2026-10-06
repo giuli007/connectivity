@@ -125,9 +125,12 @@
             </div>
             <div class="history-actions">
               <button type="button" class="button button-secondary" id="export">Export JSON</button>
+              <button type="button" class="button button-secondary" id="import">Import JSON</button>
+              <input type="file" id="import-file" accept=".json,application/json" hidden>
               <button type="button" class="button button-plain" id="clear">Clear history</button>
             </div>
           </div>
+          <p id="import-status" class="import-status" role="status" aria-live="polite"></p>
           <div id="history-days" class="history-days"></div>
           <div id="history-empty" class="empty-state">
             <span class="empty-icon" aria-hidden="true">◎</span>

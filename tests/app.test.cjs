@@ -121,7 +121,7 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
   vm.runInContext(source, context, { filename: "app.js" });
 
   return {
-    clock, nodes, requests, responses, downloads, document,
+    clock, nodes, requests, responses, downloads, document, window,
     state() { return shared.has(dataKey) ? JSON.parse(shared.get(dataKey)) : vm.runInContext("state", context); },
     memoryState() { return vm.runInContext("state", context); },
     evaluate(expression) { return vm.runInContext(expression, context); },
@@ -129,6 +129,11 @@ function createBrowser({ shared = new Map(), clock = { now: Date.parse("2026-09-
     dispatch(event, value) { windowListeners.get(event)(value); },
     dispatchDocument(event) { documentListeners.get(event)(); },
     pulse() { intervals.forEach(callback => callback()); },
+    async importFile(raw, { name = "history.json", size = raw.length } = {}) {
+      const input = nodes.get("import-file");
+      input.files = [{ name, size, text: async () => raw }];
+      await input.listeners.get("change")();
+    },
     async fire(delay) {
       const entry = [...timers].find(([, timer]) => timer.delay === delay);
       assert.ok(entry, `Expected a ${delay}ms timer`);
@@ -609,4 +614,117 @@ test("24-hour windows remain UTC-based through DST and local timestamps distingu
     if (previousTimezone === undefined) delete process.env.TZ;
     else process.env.TZ = previousTimezone;
   }
+});
+
+test("importing an older export replaces history, keeps settings, and leaves the time since export unobserved", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  browser.clock.now += 15000;
+  browser.responses.push("network-error");
+  await browser.fire(15000);
+  assert.ok(browser.state().activeOutage);
+
+  const exported = {
+    version: 1, enabled: false, intervalMs: 60000, status: "offline",
+    lastCheckedAt: "2026-09-26T10:00:00.000Z", lastSuccessAt: "2026-09-26T09:59:00.000Z",
+    lastFailureReason: "The probe could not be reached.",
+    activeOutage: { firstFailureAt: "2026-09-26T09:59:30.000Z", lastFailureAt: "2026-09-26T10:00:00.000Z", lastSuccessBeforeAt: "2026-09-26T09:59:00.000Z" },
+    outages: [{ firstFailureAt: "2026-09-26T08:00:00.000Z", lastFailureAt: "2026-09-26T08:01:00.000Z",
+      lastSuccessBeforeAt: null, firstSuccessAfterAt: "2026-09-26T08:02:00.000Z" }],
+    unknowns: [{ startAt: "2026-09-26T09:00:00.000Z", endAt: "2026-09-26T09:30:00.000Z" }],
+    gapOnNextCheck: false, exportedAt: "2026-09-26T10:00:05.000Z"
+  };
+  await browser.importFile(JSON.stringify(exported));
+  const imported = browser.state();
+  assert.equal(imported.enabled, true);
+  assert.equal(imported.intervalMs, 15000);
+  assert.equal(imported.lastCheckedAt, exported.lastCheckedAt);
+  assert.equal(imported.activeOutage, null);
+  assert.deepEqual(imported.outages, [...exported.outages, exported.activeOutage]);
+  assert.deepEqual(imported.unknowns, exported.unknowns);
+  assert.deepEqual(imported.recentChecks, []);
+  assert.equal(imported.gapOnNextCheck, true);
+  assert.equal("exportedAt" in imported, false);
+  assert.equal(browser.nodes.get("import-status").textContent,
+    "Imported history.json: 2 outages, 1 unobserved interval, 0 recent checks.");
+
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  const resumed = browser.state();
+  assert.deepEqual(resumed.unknowns[resumed.unknowns.length - 1],
+    { startAt: exported.lastCheckedAt, endAt: new Date(browser.clock.now).toISOString() });
+  assert.equal(resumed.outages.length, 2);
+  assert.equal(resumed.outages[1].firstSuccessAfterAt, undefined);
+  assert.equal(resumed.recentChecks[0].gapBefore, true);
+  assert.equal(resumed.status, "online");
+});
+
+test("an exported history imports back into another browser unchanged", async () => {
+  const source = createBrowser();
+  source.click("start");
+  for (const response of ["connectivity-monitor-ok", "network-error", "connectivity-monitor-ok"]) {
+    source.responses.push(response);
+    await source.fire(source.state().lastCheckedAt ? 15000 : 0);
+    source.clock.now += 15000;
+  }
+  source.click("export");
+  const raw = await source.downloads[0].text();
+
+  const target = createBrowser({ clock: source.clock });
+  await target.importFile(raw);
+  const original = source.state();
+  const imported = target.state();
+  assert.equal(imported.enabled, false);
+  for (const key of ["outages", "unknowns", "recentChecks", "activeOutage", "lastCheckedAt", "lastSuccessAt", "status"]) {
+    assert.deepEqual(imported[key], original[key], key);
+  }
+  assert.equal(imported.outages.length, 1);
+  assert.equal(imported.recentChecks.length, 3);
+  assert.equal(imported.gapOnNextCheck, true);
+  assert.equal(target.nodes.get("timeline-summary").textContent, "2 successful · 1 failed checks");
+});
+
+test("invalid, oversized, or declined imports leave history unchanged", async () => {
+  const browser = createBrowser();
+  browser.click("start");
+  browser.responses.push("connectivity-monitor-ok");
+  await browser.fire(0);
+  const before = browser.state();
+  let confirms = 0;
+  browser.window.confirm = () => { confirms += 1; return false; };
+  const valid = JSON.parse(browser.evaluate("JSON.stringify(emptyState())"));
+
+  for (const raw of ["not json", "null", JSON.stringify({ ...valid, version: 2 }),
+    JSON.stringify({ ...valid, outages: [{ firstFailureAt: "soon" }] })]) {
+    await browser.importFile(raw, { name: "bad.json" });
+    assert.equal(browser.nodes.get("import-status").textContent,
+      "bad.json is not a connectivity history export. Nothing was changed.");
+  }
+  await browser.importFile(JSON.stringify(valid), { name: "big.json", size: 11 * 1024 * 1024 });
+  assert.match(browser.nodes.get("import-status").textContent, /^big\.json is larger than 10 MB/);
+  assert.equal(confirms, 0);
+
+  browser.nodes.get("import-status").textContent = "";
+  await browser.importFile(JSON.stringify(valid));
+  assert.equal(confirms, 1);
+  assert.equal(browser.nodes.get("import-status").textContent, "");
+  assert.deepEqual(browser.state(), before);
+});
+
+test("imported history is capped and expired recent checks are pruned", async () => {
+  const browser = createBrowser();
+  const saved = JSON.parse(browser.evaluate("JSON.stringify(emptyState())"));
+  saved.outages = Array.from({ length: 1001 }, (_value, index) => {
+    const at = new Date(Date.parse("2026-09-01T00:00:00Z") + index * 60000).toISOString();
+    return { firstFailureAt: at, lastFailureAt: at, lastSuccessBeforeAt: null, firstSuccessAfterAt: null };
+  });
+  saved.recentChecks = ["2026-09-26T11:59:59.000Z", "2026-09-27T11:59:00.000Z"]
+    .map(checkedAt => ({ checkedAt, ok: true, reason: null, intervalMs: 15000, gapBefore: false }));
+  saved.lastCheckedAt = "2026-09-27T11:59:00.000Z";
+  await browser.importFile(JSON.stringify(saved));
+  assert.equal(browser.state().outages.length, 1000);
+  assert.equal(browser.state().outages[0].firstFailureAt, "2026-09-01T00:01:00.000Z");
+  assert.deepEqual(browser.state().recentChecks.map(record => record.checkedAt), ["2026-09-27T11:59:00.000Z"]);
 });
